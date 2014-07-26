@@ -1,15 +1,15 @@
 /**
- * Pooled Ajax Worker
- * 
- * Ce plugin permet de mutualiser les workers Ajax entre plusieurs onglets
- * d'un même domaine
- * 
+ * Pooled Worker
+ *
+ * Ce plugin permet de mutualiser des workers entre plusieurs onglets
+ * d'un même domaine.
+ *
  * Le premier worker à démarrer prend le rôle de maitre, c'est lui qui
- * executera les requetes ajax et qui transmettra leurs réponses aux autres
+ * executera les requetes et qui transmettra leurs réponses aux autres
  * workers.
  *
  * Les workers qui démarrent après le worker maitre prennent le rôle
- * d'esclaves, ils attendent les reponses des requetes ajax transmises par le
+ * d'esclaves, ils attendent les reponses des requetes transmises par le
  * worker maitre.
  *
  * Quand un worker maitre s'arrête de fonctionner (arrêt via l'API, fermeture
@@ -26,20 +26,23 @@
      * @param settings
      * @constructor
      */
-    $.PooledAjaxWorker = function(id, settings) {
+    $.PooledWorker = function(id, settings) {
         this.id = id;
         this.settings = $.extend(true, this.defaultSettings, settings);
-        
+
+        // Flag that tell if the worker is working
+        this.is_working = false;
+
         // Flag that tell if we are the master worker
         this.is_master = false;
-        
+
         // Shortcut for storage handler
         this.storage = this.settings.storage.handler;
 
         // The worker timer
         this.worker_timer = null;
 
-        // Destroy the lock if we are the master
+        // Destroy the lock on page quit (if we are the master)
         var self = this;
         $(window).on('unload', function() {
             if (self.is_master) {
@@ -53,7 +56,7 @@
      *
      * @returns {boolean}
      */
-    $.PooledAjaxWorker.prototype.locked = function() {
+    $.PooledWorker.prototype.locked = function() {
         // It is never locked when we are the master !
         if (this.is_master) {
             return false;
@@ -69,7 +72,7 @@
      *
      * @param duration
      */
-    $.PooledAjaxWorker.prototype.lock = function(duration) {
+    $.PooledWorker.prototype.lock = function(duration) {
         var time = new Date().getTime();
         this.storage.setItem(this.settings.storage.lockKey, time + duration);
         // Now we are the master
@@ -79,7 +82,7 @@
     /**
      * Unlock
      */
-    $.PooledAjaxWorker.prototype.unlock = function() {
+    $.PooledWorker.prototype.unlock = function() {
         this.storage.setItem(this.settings.storage.lockKey, null);
         // We are no more the master
         this.is_master = false;
@@ -90,11 +93,11 @@
      *
      * @param callback
      */
-    $.PooledAjaxWorker.prototype.startListener = function(callback) {
+    $.PooledWorker.prototype.startListener = function(callback) {
         $(window).on('storage', {
             callback: callback,
             responseKey: this.settings.storage.responseKey
-        }, this.listenEvent);
+        }, this.listenReceive);
     };
 
     /**
@@ -102,88 +105,117 @@
      *
      * @param callback
      */
-    $.PooledAjaxWorker.prototype.stopListener = function(callback) {
-        $(window).off('storage', this.listenEvent);
+    $.PooledWorker.prototype.stopListener = function(callback) {
+        $(window).off('storage', this.listenReceive);
     };
 
     /**
-     * Listen event
+     * Listener receive event handler
      *
      * @param event
      */
-    $.PooledAjaxWorker.prototype.listenEvent = function(event) {
-        var args = event.data || event.originalEvent.data || {};
+    $.PooledWorker.prototype.listenReceive = function(event) {
+        var params = event.data || event.originalEvent.data || {};
         var key = event.key || event.originalEvent.key;
-        // Check if the key match tje responseKey
-        if (key == args.responseKey) {
-            if (typeof args.callback == 'function') {
-                // Execute the callback
-                args.callback.apply(event, [
-                    event.newValue || event.originalEvent.newValue
-                ]);
+        var value = event.newValue || event.originalEvent.newValue;
+        // Check if the key match the responseKey
+        if (key == params.responseKey) {
+            // Execute the callback
+            if (typeof params.callback == 'function') {
+                params.callback.apply(event, [value]);
             }
         }
     };
 
-    $.PooledAjaxWorker.prototype.startWorker = function(callback) {
-        //
-        // Launch the worker
-        this.launchWorker(callback);
+    /**
+     * Propagate data to slaves
+     *
+     * @param data
+     */
+    $.PooledWorker.prototype.propagateData = function(data) {
+        this.storage.setItem(this.settings.storage.responseKey, data);
     };
 
+
     /**
-     * Start the worker and trigger callback upon new data
+     * Start the worker and trigger the callback upon new data
      *
      * @param callback
      */
-    $.PooledAjaxWorker.prototype.launchWorker = function(callback) {
+    $.PooledWorker.prototype.startWorker = function(callback) {
         var self = this;
 
-        // Not locked
-        if (!self.locked()) {
+        self.is_working = true;
 
-            // Lock during the ajax query (using ajax timeout as duration)
-            self.lock(self.settings.ajax.timeout);
-
-            // Execute the ajax query
-            $.ajax($.extend(true, {}, self.settings.ajax, { data: { html: 'test '+(new Date().getTime()) }})) //@todo remove
-
-                .done(function(response) {
-
-                    // Execute the callback
-                    callback.apply(event, [response]);
-
-                    // Propagate the ajax response
-                    this.storage.setItem(self.settings.storage.responseKey, response);
-                })
-
-                .always(function() {
-
-                    // Lock during the delayed execution
-                    self.lock(self.settings.ajax.timeout);
-
-                    // Re-launch the worker with a delay
+        // Launch the worker
+        self.triggerWorker()
+            // When the worker has succeeded a query
+            .done(function(data) {
+                // Triggers the callback
+                if (typeof callback == 'function') {
+                    callback.apply(event, [data]);
+                }
+            })
+            // When the worker has finished
+            .always(function() {
+                if (self.is_working) {
+                    // Triggers the worker again with a delay
                     self.worker_timer = setTimeout(function() {
-                        self.launchWorker(callback);
-                    }, self.settings.interval);
+                        self.startWorker(callback);
+                    }, self.settings.delay);
+                    // Lock during the delayed execution if we are the master worker
+                    if (self.is_master) {
+                        self.lock(self.settings.delay);
+                    }
+                }
+            })
+        ;
+    };
+
+    /**
+     * Triggers the worker and return a promise
+     *
+     * @returns {*}
+     */
+    $.PooledWorker.prototype.triggerWorker = function() {
+        var self = this;
+
+        // Create a new deferred response
+        var response = $.Deferred();
+
+        // Locked
+        if (self.locked()) {
+            // Reject the response's promise 
+            response.rejectWith(self);
+        }
+
+        // Not locked
+        else {
+            // Execute the query
+            self.settings.query.handler()
+                // Query succeeded
+                .done(function(data) {
+                    // Propagate data
+                    self.propagateData(data);
+                    // Resolve the response's promise
+                    response.resolveWith(self);
+                })
+                // Query failed
+                .fail(function(error) {
+                    // Reject the response's promise
+                    response.rejectWith(self);
                 })
             ;
         }
 
-        // Locked
-        else {
-            // Re-launch the worker with a delay
-            self.worker_timer = setTimeout(function() {
-                self.launchWorker(callback);
-            }, self.settings.interval);
-        }
+        return response.promise();
     };
 
     /**
      * Stop the worker
      */
-    $.PooledAjaxWorker.prototype.stopWorker = function() {
-        // Stop the worker
+    $.PooledWorker.prototype.stopWorker = function() {
+        // Stop delayed worker
         if (this.worker_timer) {
             clearTimeout(this.worker_timer);
         }
@@ -191,12 +223,13 @@
         if (this.is_master) {
             this.unlock();
         }
+        this.is_working = false;
     };
 
     /**
      * Start the worker + the listener and trigger callback upon new data
      */
-    $.PooledAjaxWorker.prototype.start = function(callback) {
+    $.PooledWorker.prototype.start = function(callback) {
         this.startWorker(callback);
         this.startListener(callback);
     };
@@ -204,7 +237,7 @@
     /**
      * Stop tje worker + the listener
      */
-    $.PooledAjaxWorker.prototype.stop = function() {
+    $.PooledWorker.prototype.stop = function() {
         this.stopWorker();
         this.stopListener();
     };
@@ -214,7 +247,7 @@
      *
      * @returns {*}
      */
-    $.PooledAjaxWorker.prototype.getSettings = function() {
+    $.PooledWorker.prototype.getSettings = function() {
         return this.settings;
     };
 
@@ -224,7 +257,7 @@
      * @param settings
      * @returns {*}
      */
-    $.PooledAjaxWorker.prototype.setSettings = function(settings) {
+    $.PooledWorker.prototype.setSettings = function(settings) {
         return this.settings = $.extend(true, this.settings, settings);
     };
 
@@ -233,7 +266,7 @@
      *
      * @type {{setItem: setItem, getItem: getItem}}
      */
-    $.PooledAjaxWorker.prototype.cookieStorage = {
+    $.PooledWorker.prototype.cookieStorage = {
 
         /**
          * Store a key with value
@@ -266,57 +299,69 @@
     /**
      * Set default settings
      */
-    $.PooledAjaxWorker.prototype.defaultSettings = {
+    $.PooledWorker.prototype.defaultSettings = {
 
-        // Interval between each worker execution
-        interval: 3000,
+        // Delay between each worker execution
+        delay: 3000,
 
         // Storage settings
         storage: {
-            responseKey: 'ajax-pool-response',
-            lockKey: 'ajax-pool-lock',
-            handler: window.localStorage ? window.localStorage : $.pooledAjaxWorker.cookieStorage
+            responseKey: 'pooled-worker-response',
+            lockKey: 'pooled-worker-lock',
+            handler: window.localStorage ? window.localStorage : $.pooledWorker.cookieStorage
         },
 
-        // Ajax settings
-        ajax: {
-            timeout: 10000
+        // Query settings
+        query: {
+            handler: function() {
+                // Lock during the ajax query (using ajax timeout as duration)
+                this.lock(this.settings.query.ajax.timeout);
+                // Execute the ajax query and return the promise
+                return $.ajax(this.settings.query.ajax);
+            },
+            ajax: {
+                timeout: 10000
+            }
         }
     };
 
 })(jQuery);
 
-
+/**
+ * Usage examples
+ */
 (function($) {
 
-    // 1. Create a new worker
-    var $worker = new $.PooledAjaxWorker('chat-worker', {
-        ajax: {
-            url: '/echo/html/',
-            type: 'POST',
-            data: {
-                html: "test",
-                delay: 3
+    // Create a new worker
+    var $worker = new $.PooledWorker('chat-worker', {
+        query: {
+            ajax: {
+                url: '/echo/html/',
+                type: 'POST',
+                data: {
+                    html: "test",
+                    delay: 3
+                }
             }
         }
     });
 
-    $worker.start();
+    // Start/stop the worker/listener
+    $worker.start(function(response) {
+        console.log('data :', data);
+    });
+    $worker.stop();
 
-    // 2. Start the worker
-    $worker.startWorker(my_callback);
-
-    // 3. Listen incoming data
-    $worker.startListener(my_callback);
-
-    // Stop the worker
+    // Start/stop the worker
+    $worker.startWorker(function(data) {
+        console.log('data from worker :', data);
+    });
     $worker.stopWorker();
 
-    // Stop listening incoming data
+    // Start/stop the listener
+    $worker.startListener(function(data) {
+        console.log('data from propagation :', data);
+    });
     $worker.stopListener();
-
-    function my_callback(response) {
-        console.log('response !', response);
-    }
 
 })(jQuery);
